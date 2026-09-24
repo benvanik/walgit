@@ -676,6 +676,417 @@ async fn memory_contract() {
     run_contract(store, "").await;
 }
 
+#[cfg(feature = "bureau")]
+mod bureau_contract {
+    use std::{
+        convert::Infallible,
+        path::{Path, PathBuf},
+        sync::Arc,
+    };
+
+    use anyhow::{Context, anyhow};
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use bytes::{Bytes, BytesMut};
+    use futures::StreamExt;
+    use http::{HeaderMap, Method, Request, Response, StatusCode, header};
+    use http_body_util::{BodyExt, Full};
+    use hyper::{body::Incoming, server::conn::http1, service::service_fn};
+    use hyper_util::rt::TokioIo;
+    use tempfile::TempDir;
+    use tokio::{net::UnixListener, task::JoinHandle};
+    use walgit_store::{
+        GetOptions, GetResult, ObjectMeta, ObjectStore, PutMode, PutOptions, StoreError, Version,
+        bureau::BureauStore, memory::MemoryStore,
+    };
+
+    use super::{DynStore, run_contract};
+
+    const HEADER_PROTOCOL: &str = "x-walgit-store-protocol";
+    const HEADER_KEY: &str = "x-walgit-key";
+    const HEADER_VERSION: &str = "x-walgit-version";
+    const HEADER_SIZE: &str = "x-walgit-size";
+    const HEADER_IF_MATCH: &str = "x-walgit-if-match";
+    const HEADER_IF_NONE_MATCH: &str = "x-walgit-if-none-match";
+    const HEADER_RANGE_START: &str = "x-walgit-range-start";
+    const HEADER_RANGE_END: &str = "x-walgit-range-end";
+    const HEADER_PUT_MODE: &str = "x-walgit-put-mode";
+    const HEADER_IMMUTABLE: &str = "x-walgit-immutable";
+    const HEADER_PREFIX: &str = "x-walgit-prefix";
+    const HEADER_START_AFTER: &str = "x-walgit-start-after";
+
+    struct FakeAdapter {
+        _directory: TempDir,
+        socket: PathBuf,
+        task: JoinHandle<()>,
+    }
+
+    impl FakeAdapter {
+        fn start() -> Self {
+            let directory = tempfile::tempdir().expect("fake adapter tempdir");
+            let socket = directory.path().join("object-store.sock");
+            let listener = UnixListener::bind(&socket).expect("bind fake adapter socket");
+            let store = Arc::new(MemoryStore::new());
+            let task = tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let store = store.clone();
+                    tokio::spawn(async move {
+                        let service = service_fn(move |request| {
+                            let store = store.clone();
+                            async move {
+                                Ok::<_, Infallible>(handle(request, store).await.unwrap_or_else(
+                                    |error| {
+                                        eprintln!(
+                                            "fake Bureau adapter rejected request: {error:#}"
+                                        );
+                                        empty_response(StatusCode::BAD_REQUEST)
+                                    },
+                                ))
+                            }
+                        });
+                        let _ = http1::Builder::new()
+                            .serve_connection(TokioIo::new(stream), service)
+                            .await;
+                    });
+                }
+            });
+            Self {
+                _directory: directory,
+                socket,
+                task,
+            }
+        }
+    }
+
+    impl Drop for FakeAdapter {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn fake_adapter_satisfies_object_store_contract() {
+        let adapter = FakeAdapter::start();
+        let cfg = walgit_config::StoreConfig {
+            backend: walgit_config::StoreBackend::Bureau,
+            bucket: String::new(),
+            bureau: walgit_config::BureauConfig {
+                socket: adapter.socket.clone(),
+            },
+            ..Default::default()
+        };
+        let store: DynStore = Arc::new(
+            BureauStore::new(&cfg)
+                .await
+                .expect("connect to fake Bureau adapter"),
+        );
+        run_contract(store.clone(), "").await;
+
+        let data = Bytes::from_static(b"0123456789abcdef");
+        store
+            .put("range-edge", data.clone().into(), PutOptions::default())
+            .await
+            .expect("put range edge fixture");
+        let result = store
+            .get(
+                "range-edge",
+                GetOptions {
+                    range: Some(99..120),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("out-of-bounds range");
+        let GetResult::Object { meta, body } = result else {
+            panic!("expected ranged object");
+        };
+        assert_eq!(meta.size, data.len() as u64);
+        assert!(
+            walgit_store::util::collect(body, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let reversed_start = 99;
+        let reversed_end = 5;
+        let result = store
+            .get(
+                "range-edge",
+                GetOptions {
+                    range: Some(reversed_start..reversed_end),
+                    ..Default::default()
+                },
+            )
+            .await;
+        let Err(error) = result else {
+            panic!("reversed range unexpectedly succeeded");
+        };
+        assert!(matches!(error, StoreError::InvalidArgument(_)));
+    }
+
+    async fn handle(
+        request: Request<Incoming>,
+        store: Arc<MemoryStore>,
+    ) -> anyhow::Result<Response<Full<Bytes>>> {
+        let method = request.method().clone();
+        let path = request.uri().path().to_owned();
+        match (method, path.as_str()) {
+            (Method::GET, "/v1/health") => Ok(Response::builder()
+                .status(StatusCode::NO_CONTENT)
+                .header(HEADER_PROTOCOL, "1")
+                .body(Full::new(Bytes::new()))?),
+            (Method::GET, "/v1/object") => get(request, store.as_ref()).await,
+            (Method::HEAD, "/v1/object") => head(request.headers(), store.as_ref()).await,
+            (Method::PUT, "/v1/object") => put(request, store.as_ref()).await,
+            (Method::DELETE, "/v1/object") => delete(request.headers(), store.as_ref()).await,
+            (Method::GET, "/v1/objects") => list(request.headers(), store.as_ref()).await,
+            (Method::GET, "/v1/prefixes") => list_prefixes(request.headers(), store.as_ref()).await,
+            _ => Ok(empty_response(StatusCode::NOT_FOUND)),
+        }
+    }
+
+    async fn get(
+        request: Request<Incoming>,
+        store: &MemoryStore,
+    ) -> anyhow::Result<Response<Full<Bytes>>> {
+        let key = required_text(request.headers(), HEADER_KEY)?;
+        let range_start = optional_u64(request.headers(), HEADER_RANGE_START)?;
+        let range_end = optional_u64(request.headers(), HEADER_RANGE_END)?;
+        let range = match (range_start, range_end) {
+            (None, None) => None,
+            (Some(start), Some(end)) => Some(start..end),
+            _ => return Ok(empty_response(StatusCode::BAD_REQUEST)),
+        };
+        let options = GetOptions {
+            if_match: optional_version(request.headers(), HEADER_IF_MATCH)?,
+            if_none_match: optional_version(request.headers(), HEADER_IF_NONE_MATCH)?,
+            range: range.clone(),
+        };
+        match store.get(&key, options).await {
+            Ok(GetResult::NotModified { version }) => Ok(Response::builder()
+                .status(StatusCode::NOT_MODIFIED)
+                .header(HEADER_VERSION, encoded(version.as_str()))
+                .body(Full::new(Bytes::new()))?),
+            Ok(GetResult::Object { meta, body }) => {
+                let bytes = walgit_store::util::collect(body, meta.size as usize).await?;
+                let status = if range.is_some() {
+                    StatusCode::PARTIAL_CONTENT
+                } else {
+                    StatusCode::OK
+                };
+                Ok(meta_response(status, &meta, bytes))
+            }
+            Err(error) => Ok(error_response(error)),
+        }
+    }
+
+    async fn head(
+        headers: &HeaderMap,
+        store: &MemoryStore,
+    ) -> anyhow::Result<Response<Full<Bytes>>> {
+        let key = required_text(headers, HEADER_KEY)?;
+        Ok(match store.head(&key).await {
+            Ok(Some(meta)) => meta_response(StatusCode::OK, &meta, Bytes::new()),
+            Ok(None) => empty_response(StatusCode::NOT_FOUND),
+            Err(error) => error_response(error),
+        })
+    }
+
+    async fn put(
+        request: Request<Incoming>,
+        store: &MemoryStore,
+    ) -> anyhow::Result<Response<Full<Bytes>>> {
+        let key = required_text(request.headers(), HEADER_KEY)?;
+        let declared_length = required_u64(request.headers(), header::CONTENT_LENGTH.as_str())?;
+        let mode = match required_header(request.headers(), HEADER_PUT_MODE)? {
+            "overwrite" => PutMode::Overwrite,
+            "create" => PutMode::Create,
+            "update" => PutMode::Update(
+                optional_version(request.headers(), HEADER_IF_MATCH)?
+                    .ok_or_else(|| anyhow!("update omitted {HEADER_IF_MATCH}"))?,
+            ),
+            value => return Err(anyhow!("unknown put mode {value:?}")),
+        };
+        let immutable = match required_header(request.headers(), HEADER_IMMUTABLE)? {
+            "true" => true,
+            "false" => false,
+            value => return Err(anyhow!("invalid immutable value {value:?}")),
+        };
+        let body = request.into_body().collect().await?.to_bytes();
+        if body.len() as u64 != declared_length {
+            return Ok(empty_response(StatusCode::BAD_REQUEST));
+        }
+        Ok(
+            match store
+                .put(
+                    &key,
+                    body.into(),
+                    PutOptions {
+                        mode,
+                        content_type: None,
+                        immutable,
+                    },
+                )
+                .await
+            {
+                Ok(meta) => meta_response(StatusCode::OK, &meta, Bytes::new()),
+                Err(error) => error_response(error),
+            },
+        )
+    }
+
+    async fn delete(
+        headers: &HeaderMap,
+        store: &MemoryStore,
+    ) -> anyhow::Result<Response<Full<Bytes>>> {
+        let key = required_text(headers, HEADER_KEY)?;
+        let version = optional_version(headers, HEADER_IF_MATCH)?;
+        Ok(match store.delete(&key, version).await {
+            Ok(()) => empty_response(StatusCode::NO_CONTENT),
+            Err(error) => error_response(error),
+        })
+    }
+
+    async fn list(
+        headers: &HeaderMap,
+        store: &MemoryStore,
+    ) -> anyhow::Result<Response<Full<Bytes>>> {
+        let prefix = required_text(headers, HEADER_PREFIX)?;
+        let start_after = optional_text(headers, HEADER_START_AFTER)?;
+        let mut objects = store.list(&prefix, start_after.as_deref());
+        let mut body = BytesMut::new();
+        while let Some(item) = objects.next().await {
+            let item = item?;
+            let record = serde_json::json!({
+                "key": item.key,
+                "size": item.size,
+                "version": item.version.as_str(),
+            });
+            body.extend_from_slice(&serde_json::to_vec(&record)?);
+            body.extend_from_slice(b"\n");
+        }
+        Ok(ndjson_response(body.freeze()))
+    }
+
+    async fn list_prefixes(
+        headers: &HeaderMap,
+        store: &MemoryStore,
+    ) -> anyhow::Result<Response<Full<Bytes>>> {
+        let prefix = required_text(headers, HEADER_PREFIX)?;
+        let prefixes = store.list_prefixes(&prefix).await?;
+        let mut body = BytesMut::new();
+        for prefix in prefixes {
+            body.extend_from_slice(&serde_json::to_vec(&prefix)?);
+            body.extend_from_slice(b"\n");
+        }
+        Ok(ndjson_response(body.freeze()))
+    }
+
+    fn meta_response(status: StatusCode, meta: &ObjectMeta, body: Bytes) -> Response<Full<Bytes>> {
+        Response::builder()
+            .status(status)
+            .header(HEADER_KEY, encoded(&meta.key))
+            .header(HEADER_VERSION, encoded(meta.version.as_str()))
+            .header(HEADER_SIZE, meta.size.to_string())
+            .header(header::CONTENT_LENGTH, body.len().to_string())
+            .body(Full::new(body))
+            .expect("metadata response")
+    }
+
+    fn ndjson_response(body: Bytes) -> Response<Full<Bytes>> {
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/x-ndjson")
+            .header(header::CONTENT_LENGTH, body.len().to_string())
+            .body(Full::new(body))
+            .expect("NDJSON response")
+    }
+
+    fn empty_response(status: StatusCode) -> Response<Full<Bytes>> {
+        Response::builder()
+            .status(status)
+            .body(Full::new(Bytes::new()))
+            .expect("empty response")
+    }
+
+    fn error_response(error: StoreError) -> Response<Full<Bytes>> {
+        match error {
+            StoreError::NotFound { .. } => empty_response(StatusCode::NOT_FOUND),
+            StoreError::PreconditionFailed { current, .. } => {
+                let mut builder = Response::builder().status(StatusCode::PRECONDITION_FAILED);
+                if let Some(version) = current {
+                    builder = builder.header(HEADER_VERSION, encoded(version.as_str()));
+                }
+                builder
+                    .body(Full::new(Bytes::new()))
+                    .expect("precondition response")
+            }
+            StoreError::InvalidArgument(_) => empty_response(StatusCode::BAD_REQUEST),
+            StoreError::Retryable(_) => empty_response(StatusCode::SERVICE_UNAVAILABLE),
+            StoreError::Other(_) => empty_response(StatusCode::INTERNAL_SERVER_ERROR),
+        }
+    }
+
+    fn encoded(value: &str) -> String {
+        URL_SAFE_NO_PAD.encode(value.as_bytes())
+    }
+
+    fn required_header<'a>(headers: &'a HeaderMap, name: &str) -> anyhow::Result<&'a str> {
+        headers
+            .get(name)
+            .with_context(|| format!("missing {name}"))?
+            .to_str()
+            .with_context(|| format!("invalid {name}"))
+    }
+
+    fn required_u64(headers: &HeaderMap, name: &str) -> anyhow::Result<u64> {
+        required_header(headers, name)?
+            .parse()
+            .with_context(|| format!("invalid {name}"))
+    }
+
+    fn optional_u64(headers: &HeaderMap, name: &str) -> anyhow::Result<Option<u64>> {
+        headers
+            .get(name)
+            .map(|value| {
+                value
+                    .to_str()
+                    .with_context(|| format!("invalid {name}"))?
+                    .parse()
+                    .with_context(|| format!("invalid {name}"))
+            })
+            .transpose()
+    }
+
+    fn required_text(headers: &HeaderMap, name: &str) -> anyhow::Result<String> {
+        optional_text(headers, name)?.with_context(|| format!("missing {name}"))
+    }
+
+    fn optional_text(headers: &HeaderMap, name: &str) -> anyhow::Result<Option<String>> {
+        headers
+            .get(name)
+            .map(|value| {
+                let encoded = value.to_str().with_context(|| format!("invalid {name}"))?;
+                let bytes = URL_SAFE_NO_PAD
+                    .decode(encoded)
+                    .with_context(|| format!("invalid base64url {name}"))?;
+                String::from_utf8(bytes).with_context(|| format!("invalid UTF-8 {name}"))
+            })
+            .transpose()
+    }
+
+    fn optional_version(headers: &HeaderMap, name: &str) -> anyhow::Result<Option<Version>> {
+        Ok(optional_text(headers, name)?.map(Version::new))
+    }
+
+    #[allow(dead_code)]
+    fn _assert_socket_is_scoped(socket: &Path) {
+        assert!(socket.is_absolute());
+    }
+}
+
 #[cfg(feature = "s3")]
 #[tokio::test]
 async fn s3_contract() {
@@ -724,6 +1135,34 @@ async fn s3_contract() {
     .await;
     for m in to_delete {
         let _ = store.delete(&m.key, None).await;
+    }
+}
+
+#[cfg(feature = "bureau")]
+#[tokio::test]
+async fn bureau_external_contract() {
+    let Ok(socket) = std::env::var("WALGIT_TEST_BUREAU_SOCKET") else {
+        eprintln!("skipping bureau_external_contract: WALGIT_TEST_BUREAU_SOCKET not set");
+        return;
+    };
+    let prefix = format!("contract-test-{}", uuid::Uuid::new_v4().simple());
+    let cfg = walgit_config::StoreConfig {
+        backend: walgit_config::StoreBackend::Bureau,
+        bucket: String::new(),
+        bureau: walgit_config::BureauConfig {
+            socket: socket.into(),
+        },
+        ..Default::default()
+    };
+    let store: DynStore = Arc::new(
+        walgit_store::bureau::BureauStore::new(&cfg)
+            .await
+            .expect("BureauStore::new"),
+    );
+    run_contract(store.clone(), &prefix).await;
+    let items = store.list(&prefix, None).collect::<Vec<_>>().await;
+    for item in items.into_iter().filter_map(Result::ok) {
+        let _ = store.delete(&item.key, None).await;
     }
 }
 
@@ -778,6 +1217,7 @@ async fn gcs_contract() {
 /// 1 GiB of a big object as 32 parallel 32 MiB ranges (bulk clients + permits)
 /// while timing small control-plane calls every 250 ms; every small call must
 /// stay under 2 s. `WALGIT_TEST_GCS_BUCKET=walgit-store WALGIT_TEST_GCS_BIG_KEY=<key under prefix>`.
+#[cfg(feature = "gcs")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn gcs_control_plane_not_starved_by_bulk() {
     const CHUNK: u64 = 32 * 1024 * 1024;

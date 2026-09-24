@@ -146,19 +146,69 @@ pub fn instance_id() -> &'static str; // explicit instance name/id, hostname+pid
 pub enum CoordError { Store(StoreError), Decode(prost::DecodeError), Aborted, RetriesExhausted{key, attempts}, Other }
 ```
 
-## walgit-store backends (owners: StoreS3, StoreGcs)
+## walgit-store backends (owners: StoreS3, StoreGcs, StoreBureau)
 
 ```rust
 // s3.rs
 pub struct S3Store; impl S3Store { pub async fn new(cfg: &walgit_config::StoreConfig) -> anyhow::Result<Self>; }
 // gcs.rs
 pub struct GcsStore; impl GcsStore { pub async fn new(cfg: &walgit_config::StoreConfig) -> anyhow::Result<Self>; }
+// bureau.rs
+pub struct BureauStore; impl BureauStore { pub async fn new(cfg: &walgit_config::StoreConfig) -> anyhow::Result<Self>; }
 // lib.rs
 pub async fn open_store(cfg: &walgit_config::Config) -> anyhow::Result<DynStore>; // by cfg.store.backend, applies Prefixed(cfg.store_prefix())
 ```
 Contract tests: `crates/walgit-store/tests/contract.rs` with a `run_contract(store: DynStore)` suite executed for
 memory always, for s3 when `WALGIT_TEST_S3_ENDPOINT` set (bucket `WALGIT_TEST_BUCKET`, default "walgit-test"),
-for gcs when `WALGIT_TEST_GCS_BUCKET` set.
+for gcs when `WALGIT_TEST_GCS_BUCKET` set, and for Bureau when `WALGIT_TEST_BUREAU_SOCKET` names a dedicated
+test adapter.
+
+### Bureau object-store adapter protocol
+
+`backend = "bureau"` speaks HTTP/1.1 over the one absolute Unix socket in
+`store.bureau.socket`. The socket is a capability-scoped object-store endpoint,
+not a Bureau control endpoint. There is no TCP, S3/GCS, alternate-socket, or
+control-socket fallback. `BureauStore::new` performs one startup
+`GET /v1/health`; the adapter must answer `204 No Content` with
+`x-walgit-store-protocol: 1`. Connect failure, any other status, or a different
+protocol version fails startup.
+
+Every key, prefix, start-after value, and opaque version carried in a request
+header is UTF-8 encoded as unpadded base64url. Object operations use
+`/v1/object`:
+
+- `GET` sends `x-walgit-key`, optional `x-walgit-if-match`,
+  `x-walgit-if-none-match`, and a pair of half-open
+  `x-walgit-range-start`/`x-walgit-range-end` decimal headers. A whole-object
+  success is `200`; a range success is `206`.
+- `HEAD` sends `x-walgit-key` and returns metadata only.
+- `PUT` sends `x-walgit-key`, exact `Content-Length`,
+  `x-walgit-put-mode: overwrite|create|update`, `x-walgit-if-match` for an
+  update, `x-walgit-immutable: true|false`, and optional `Content-Type`.
+  Its body is streamed once and is never automatically replayed.
+- `DELETE` sends `x-walgit-key` and optional `x-walgit-if-match`; success is
+  `204`.
+
+Successful object reads, heads, and writes carry `x-walgit-key`,
+`x-walgit-version`, and decimal `x-walgit-size`; size is always the whole
+object size. GET also carries an exact body `Content-Length`. Missing,
+malformed, mismatched, truncated, or overlong metadata/body is a protocol
+failure rather than fabricated metadata.
+
+`GET /v1/objects` sends `x-walgit-prefix` and optional
+`x-walgit-start-after`. It returns `application/x-ndjson`, one
+`{"key": string, "size": u64, "version": string}` record per line, in strict
+lexicographic order and within the requested prefix/start boundary.
+`GET /v1/prefixes` sends `x-walgit-prefix` and returns one JSON string per
+line, sorted, unique, within the requested prefix, and ending in `/`. Records
+are size-bounded and parsed incrementally; object bodies are never buffered by
+the backend.
+
+`304` means `NotModified` and must carry `x-walgit-version`; `404` means
+`NotFound` (`HEAD` returns `None`); `412` means `PreconditionFailed` and may
+carry the current `x-walgit-version`; `400` is `InvalidArgument`; `429` and
+`5xx` are retryable. Unexpected permanent statuses and malformed protocol
+responses fail closed. Compose, signed URLs, and acceleration are unsupported.
 
 ## walgit-wal (owner: Wal)
 

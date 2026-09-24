@@ -5,7 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-default = ["gcs", "s3"]
+default = ["bureau", "gcs", "s3"]
+bureau = ["dep:base64", "dep:http-body-util", "dep:hyper", "dep:hyper-util"]
 gcs = ["dep:google-cloud-storage", "dep:google-cloud-gax", "dep:google-cloud-auth", "dep:reqwest"]
 s3 = ["dep:aws-config", "dep:aws-sdk-s3", "dep:aws-smithy-types", "dep:reqwest"]
 
@@ -29,6 +30,11 @@ rand.workspace = true
 uuid.workspace = true
 hex.workspace = true
 http.workspace = true
+serde_json.workspace = true
+base64 = { workspace = true, optional = true }
+http-body-util = { workspace = true, optional = true }
+hyper = { workspace = true, optional = true }
+hyper-util = { workspace = true, optional = true }
 google-cloud-storage = { workspace = true, optional = true }
 google-cloud-gax = { workspace = true, optional = true }
 google-cloud-auth = { workspace = true, optional = true }

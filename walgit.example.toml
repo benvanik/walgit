@@ -64,12 +64,17 @@ anonymous_read = true             # must be false in oidc mode
 # trusted_forwarders = []                  # principals allowed to set X-Walgit-Principal (a front in front of a push broker)
 
 [store]
-backend = "s3"                    # "s3" (AWS, MinIO, rustfs, R2, Ceph, …) | "gcs" | "memory" (tests)
-bucket = "walgit"
-prefix = ""                       # global key prefix inside the bucket
+backend = "s3"                    # "s3" (AWS, MinIO, rustfs, R2, Ceph, …) | "gcs" | "bureau" | "memory" (tests)
+bucket = "walgit"                 # required for s3/gcs; ignored by bureau/memory
+prefix = ""                       # global key prefix inside the selected store
 max_retries = 8                   # retries on retryable store errors (jittered backoff)
 multipart_threshold = "64MiB"     # PUTs above this use multipart/resumable uploads
 multipart_part_size = "32MiB"
+
+[store.bureau]
+# Dedicated capability-scoped object-store adapter socket. This is not a Bureau
+# control socket, and backend = "bureau" fails startup if it is absent or incompatible.
+socket = "/run/bureau/walgit-object-store.sock"
 
 [store.s3]
 endpoint = "https://s3.us-east-1.amazonaws.com"   # or http://127.0.0.1:9000 for rustfs/MinIO

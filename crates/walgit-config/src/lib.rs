@@ -233,6 +233,7 @@ pub struct StoreConfig {
     pub bucket: String,
     /// Global key prefix inside the bucket (no leading slash; trailing slash added).
     pub prefix: String,
+    pub bureau: BureauConfig,
     pub gcs: GcsConfig,
     pub s3: S3Config,
     pub max_retries: u32,
@@ -247,8 +248,17 @@ pub enum StoreBackend {
     #[default]
     Gcs,
     S3,
+    /// Bureau's capability-scoped object-store adapter over a Unix socket.
+    Bureau,
     /// Tests only.
     Memory,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct BureauConfig {
+    /// Dedicated object-store adapter socket. This is never a Bureau control socket.
+    pub socket: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -840,6 +850,7 @@ impl Default for StoreConfig {
             backend: StoreBackend::Gcs,
             bucket: "walgit".into(),
             prefix: String::new(),
+            bureau: BureauConfig::default(),
             gcs: GcsConfig::default(),
             s3: S3Config::default(),
             max_retries: 8,
@@ -1087,7 +1098,18 @@ impl Config {
             (1..=64).contains(&self.packfile_uri.max_uris_per_fetch),
             "packfile_uri.max_uris_per_fetch must be 1..=64"
         );
-        anyhow::ensure!(!self.store.bucket.is_empty(), "store.bucket must be set");
+        match self.store.backend {
+            StoreBackend::Gcs | StoreBackend::S3 => {
+                anyhow::ensure!(!self.store.bucket.is_empty(), "store.bucket must be set");
+            }
+            StoreBackend::Bureau => {
+                anyhow::ensure!(
+                    self.store.bureau.socket.is_absolute(),
+                    "store.bureau.socket must be an absolute path"
+                );
+            }
+            StoreBackend::Memory => {}
+        }
         let t = &self.server.tls;
         match t.mode {
             TlsMode::Files => anyhow::ensure!(
@@ -1380,6 +1402,64 @@ mod tests {
         assert_eq!(c.store.s3.endpoint, "http://rustfs:9000");
         assert_eq!(c.wal.max_batch, 7);
         assert_eq!(c.server.listen.port(), 9090);
+    }
+
+    #[test]
+    fn bureau_store_config_round_trips() {
+        let c = Config::parse(
+            r#"
+            [store]
+            backend = "bureau"
+            bucket = ""
+            prefix = "tenant/repository"
+
+            [store.bureau]
+            socket = "/run/bureau/walgit-object-store.sock"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(c.store.backend, StoreBackend::Bureau);
+        assert_eq!(
+            c.store.bureau.socket,
+            PathBuf::from("/run/bureau/walgit-object-store.sock")
+        );
+        let text = toml::to_string(&c).unwrap();
+        let back = Config::parse(&text).unwrap();
+        assert_eq!(back.store.backend, StoreBackend::Bureau);
+        assert_eq!(back.store.bureau.socket, c.store.bureau.socket);
+    }
+
+    #[test]
+    fn bureau_store_requires_absolute_socket() {
+        let mut c = Config::default();
+        c.store.backend = StoreBackend::Bureau;
+        c.store.bucket.clear();
+
+        let error = c.validate().unwrap_err().to_string();
+        assert!(error.contains("store.bureau.socket must be an absolute path"));
+
+        c.store.bureau.socket = PathBuf::from("run/bureau/object-store.sock");
+        let error = c.validate().unwrap_err().to_string();
+        assert!(error.contains("store.bureau.socket must be an absolute path"));
+
+        c.store.bureau.socket = PathBuf::from("/run/bureau/object-store.sock");
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn bucket_is_required_only_for_bucket_backends() {
+        for backend in [StoreBackend::Gcs, StoreBackend::S3] {
+            let mut c = Config::default();
+            c.store.backend = backend;
+            c.store.bucket.clear();
+            let error = c.validate().unwrap_err().to_string();
+            assert!(error.contains("store.bucket must be set"));
+        }
+
+        let mut memory = Config::default();
+        memory.store.backend = StoreBackend::Memory;
+        memory.store.bucket.clear();
+        memory.validate().unwrap();
     }
 
     #[test]

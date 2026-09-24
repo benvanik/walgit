@@ -18,6 +18,8 @@ use tracing::Instrument;
 
 pub mod coord;
 pub use coord::CoordError;
+#[cfg(feature = "bureau")]
+pub mod bureau;
 pub mod fault;
 #[cfg(feature = "gcs")]
 pub mod gcs;
@@ -633,6 +635,16 @@ pub async fn open_store(cfg: &walgit_config::Config) -> anyhow::Result<DynStore>
     let prefix = cfg.store_prefix();
     let inner: DynStore = match cfg.store.backend {
         walgit_config::StoreBackend::Memory => Arc::new(memory::MemoryStore::new()),
+        walgit_config::StoreBackend::Bureau => {
+            #[cfg(feature = "bureau")]
+            {
+                Arc::new(bureau::BureauStore::new(&cfg.store).await?)
+            }
+            #[cfg(not(feature = "bureau"))]
+            {
+                anyhow::bail!("bureau backend requires the `bureau` feature")
+            }
+        }
         walgit_config::StoreBackend::S3 => {
             #[cfg(feature = "s3")]
             {
