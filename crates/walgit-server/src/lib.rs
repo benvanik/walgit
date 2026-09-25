@@ -64,6 +64,7 @@ pub mod web;
 
 use std::future::Future;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::Router;
@@ -536,13 +537,235 @@ fn set_nodelay(stream: &mut tokio::net::TcpStream) {
     }
 }
 
+#[cfg(unix)]
+struct UnixAccept {
+    listener: tokio::net::UnixListener,
+    path: PathBuf,
+}
+
+#[cfg(unix)]
+impl UnixAccept {
+    async fn bind(path: &Path) -> anyhow::Result<Self> {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+
+        anyhow::ensure!(
+            path.is_absolute()
+                && path.components().all(|component| {
+                    matches!(
+                        component,
+                        std::path::Component::RootDir | std::path::Component::Normal(_)
+                    )
+                }),
+            "Unix listener path must be clean and absolute"
+        );
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("Unix listener path has no parent"))?;
+        let parent_metadata = std::fs::symlink_metadata(parent)
+            .map_err(|error| anyhow::anyhow!("inspect Unix listener parent: {error}"))?;
+        anyhow::ensure!(
+            parent_metadata.file_type().is_dir(),
+            "Unix listener parent is not a directory: {}",
+            parent.display()
+        );
+        // SAFETY: geteuid takes no pointers and has no failure mode.
+        #[allow(unsafe_code)]
+        let effective_uid = unsafe { libc::geteuid() };
+        anyhow::ensure!(
+            parent_metadata.uid() == effective_uid,
+            "Unix listener parent is not owned by the current user: {}",
+            parent.display()
+        );
+        anyhow::ensure!(
+            parent_metadata.mode() & 0o022 == 0,
+            "Unix listener parent must not be group- or other-writable: {}",
+            parent.display()
+        );
+
+        let staging = tempfile::Builder::new()
+            .prefix(".walgit-listener-")
+            .tempdir_in(parent)
+            .map_err(|error| anyhow::anyhow!("create Unix listener staging directory: {error}"))?;
+        std::fs::set_permissions(staging.path(), std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| anyhow::anyhow!("secure Unix listener staging directory: {error}"))?;
+        let staged_path = staging.path().join("listener.sock");
+        let listener = tokio::net::UnixListener::bind(&staged_path).map_err(|error| {
+            anyhow::anyhow!(
+                "bind staged Unix listener {}: {error}",
+                staged_path.display()
+            )
+        })?;
+        std::fs::set_permissions(&staged_path, std::fs::Permissions::from_mode(0o660))
+            .map_err(|error| anyhow::anyhow!("set staged Unix listener permissions: {error}"))?;
+        let staged_metadata = std::fs::symlink_metadata(&staged_path)
+            .map_err(|error| anyhow::anyhow!("inspect staged Unix listener: {error}"))?;
+        anyhow::ensure!(
+            staged_metadata.file_type().is_socket(),
+            "staged Unix listener is not a socket"
+        );
+        remove_stale_unix_socket(path).await?;
+        std::fs::rename(&staged_path, path).map_err(|error| {
+            anyhow::anyhow!("publish Unix listener {}: {error}", path.display())
+        })?;
+        let published_metadata = std::fs::symlink_metadata(path)
+            .map_err(|error| anyhow::anyhow!("inspect published Unix listener: {error}"))?;
+        anyhow::ensure!(
+            published_metadata.file_type().is_socket()
+                && published_metadata.dev() == staged_metadata.dev()
+                && published_metadata.ino() == staged_metadata.ino(),
+            "published Unix listener identity changed: {}",
+            path.display()
+        );
+        Ok(Self {
+            listener,
+            path: path.to_path_buf(),
+        })
+    }
+}
+
+#[cfg(unix)]
+impl axum::serve::Listener for UnixAccept {
+    type Io = tokio::net::UnixStream;
+    type Addr = ();
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            match self.listener.accept().await {
+                Ok((stream, _)) => return (stream, ()),
+                Err(error) => {
+                    tracing::warn!(
+                        path = %self.path.display(),
+                        error = ?error,
+                        "Unix accept failed"
+                    );
+                }
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+async fn remove_stale_unix_socket(path: &Path) -> anyhow::Result<()> {
+    use std::io::ErrorKind;
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "inspect Unix listener {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    anyhow::ensure!(
+        metadata.file_type().is_socket(),
+        "Unix listener path already exists and is not a socket: {}",
+        path.display()
+    );
+    match tokio::net::UnixStream::connect(path).await {
+        Ok(_) => anyhow::bail!("Unix listener is already active: {}", path.display()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::ConnectionRefused | ErrorKind::NotFound
+            ) => {}
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "probe existing Unix listener {}: {error}",
+                path.display()
+            ));
+        }
+    }
+    let current = std::fs::symlink_metadata(path).map_err(|error| {
+        anyhow::anyhow!("reinspect stale Unix listener {}: {error}", path.display())
+    })?;
+    anyhow::ensure!(
+        current.file_type().is_socket()
+            && current.dev() == metadata.dev()
+            && current.ino() == metadata.ino(),
+        "Unix listener changed while checking staleness: {}",
+        path.display()
+    );
+    std::fs::remove_file(path)
+        .map_err(|error| anyhow::anyhow!("remove stale Unix listener: {error}"))
+}
+
+enum BoundListener {
+    Tcp(TcpAccept),
+    #[cfg(unix)]
+    Unix(UnixAccept),
+}
+
 /// Bind, serve (HTTP/1.1 + h2c, or TLS with ALPN h2/http1.1 when
 /// `server.tls` is on), graceful shutdown on `shutdown`.
 pub async fn serve(
     state: Arc<AppState>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
-    let addr = state.cfg.server.listen;
+    serve_bound(state, shutdown, None).await
+}
+
+/// Bind the HTTP server to one filesystem-scoped Unix socket. This transport
+/// deliberately has no TLS or accel-redirect mode: filesystem custody is the
+/// local hop boundary and no TCP peer address exists.
+pub async fn serve_unix(
+    state: Arc<AppState>,
+    socket_path: impl AsRef<Path>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        anyhow::ensure!(
+            !state.cfg.tls_enabled(),
+            "Unix listener requires server.tls.mode = \"off\""
+        );
+        anyhow::ensure!(
+            !state.cfg.server.accel_redirect,
+            "Unix listener does not support server.accel_redirect"
+        );
+        serve_bound(state, shutdown, Some(socket_path.as_ref().to_path_buf())).await
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (state, socket_path, shutdown);
+        anyhow::bail!("Unix listeners are unsupported on this platform")
+    }
+}
+
+async fn serve_bound(
+    state: Arc<AppState>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+    unix_socket: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let listener = if let Some(path) = unix_socket {
+        #[cfg(unix)]
+        {
+            tracing::info!(path = %path.display(), "binding Unix HTTP listener");
+            BoundListener::Unix(UnixAccept::bind(&path).await?)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            anyhow::bail!("Unix listeners are unsupported on this platform")
+        }
+    } else {
+        let addr = state.cfg.server.listen;
+        let listener = TcpAccept::bind(addr).await?;
+        tracing::info!(
+            %addr,
+            addrs = ?listener.addrs(),
+            tls = state.tls.is_some(),
+            url = %listen_url(&state.cfg),
+            "walgit-server listening"
+        );
+        BoundListener::Tcp(listener)
+    };
     // Resolve the machine type before the first request, so `/readyz`, `/healthz`
     // and the UI footer only read a cell that is already filled (principle VI).
     instance::init_machine_type(&state.cfg).await;
@@ -551,9 +774,7 @@ pub async fn serve(
     bridge::spawn_sweeper(state.clone());
     spawn_runtime_watchdog(state.registry.tasks().clone(), state.inflight.clone());
     let app = router(state);
-    let listener = TcpAccept::bind(addr).await?;
     let tls = state_for_shutdown.tls.clone();
-    tracing::info!(%addr, addrs = ?listener.addrs(), tls = tls.is_some(), url = %listen_url(&state_for_shutdown.cfg), "walgit-server listening");
 
     let st = state_for_shutdown.clone();
     let phase2 = Arc::new(tokio::sync::Notify::new());
@@ -593,24 +814,38 @@ pub async fn serve(
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     };
     let serving = async move {
-        if let Some(t) = tls {
-            axum::serve(
-                tls::TlsListener {
-                    tcp: listener,
-                    acceptor: t.acceptor.clone(),
-                },
-                app,
-            )
-            .with_graceful_shutdown(graceful)
-            .await
-        } else {
-            use axum::serve::ListenerExt;
-            axum::serve(
-                NodelayListener(listener).tap_io(set_nodelay),
-                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-            )
-            .with_graceful_shutdown(graceful)
-            .await
+        match listener {
+            BoundListener::Tcp(listener) => {
+                if let Some(t) = tls {
+                    axum::serve(
+                        tls::TlsListener {
+                            tcp: listener,
+                            acceptor: t.acceptor.clone(),
+                        },
+                        app,
+                    )
+                    .with_graceful_shutdown(graceful)
+                    .await
+                } else {
+                    use axum::serve::ListenerExt;
+                    axum::serve(
+                        NodelayListener(listener).tap_io(set_nodelay),
+                        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                    )
+                    .with_graceful_shutdown(graceful)
+                    .await
+                }
+            }
+            #[cfg(unix)]
+            BoundListener::Unix(listener) => {
+                tracing::info!(
+                    path = %listener.path.display(),
+                    "walgit-server listening on Unix socket"
+                );
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(graceful)
+                    .await
+            }
         }
     };
     // In-flight requests get `server.drain_timeout` from phase 2 on (a stuck
@@ -651,6 +886,15 @@ const UNIT_STOP_MAX: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[cfg(test)]
 mod listen_tests {
+    #[cfg(unix)]
+    fn secure_tempdir() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        directory
+    }
+
     #[tokio::test]
     async fn ipv4_loopback_also_accepts_ipv6() {
         let m = super::TcpAccept::bind("127.0.0.1:0".parse().unwrap())
@@ -663,5 +907,138 @@ mod listen_tests {
         tokio::net::TcpStream::connect((std::net::Ipv6Addr::LOCALHOST, port))
             .await
             .expect("::1 twin");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_listener_stages_permissions_and_replaces_only_stale_sockets() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = secure_tempdir();
+        let path = directory.path().join("walgit.sock");
+        let stale = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        drop(stale);
+
+        let listener = super::UnixAccept::bind(&path).await.unwrap();
+        assert_eq!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o660
+        );
+        let connect = tokio::net::UnixStream::connect(&path);
+        let accept = listener.listener.accept();
+        let (connected, accepted) = tokio::join!(connect, accept);
+        connected.unwrap();
+        accepted.unwrap();
+        drop(listener);
+        assert!(path.exists());
+
+        let replacement = super::UnixAccept::bind(&path).await.unwrap();
+        drop(replacement);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_listener_refuses_non_socket_and_active_socket_paths() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = secure_tempdir();
+        let regular = directory.path().join("regular");
+        std::fs::write(&regular, b"not a socket").unwrap();
+        let error = super::UnixAccept::bind(&regular).await.err().unwrap();
+        assert!(error.to_string().contains("is not a socket"), "{error}");
+
+        let path = directory.path().join("active.sock");
+        let listener = super::UnixAccept::bind(&path).await.unwrap();
+        let error = super::UnixAccept::bind(&path).await.err().unwrap();
+        assert!(error.to_string().contains("already active"), "{error}");
+        drop(listener);
+
+        let shared = directory.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let error = super::UnixAccept::bind(&shared.join("walgit.sock"))
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            error.to_string().contains("group- or other-writable"),
+            "{error}"
+        );
+
+        let error = super::UnixAccept::bind(&directory.path().join("shared/../unclean.sock"))
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("clean and absolute"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_server_serves_http_and_leaves_socket_for_stale_recovery() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use walgit_config::{Config, StoreBackend};
+        use walgit_store::DynStore;
+        use walgit_store::memory::MemoryStore;
+
+        let directory = secure_tempdir();
+        let path = directory.path().join("walgit.sock");
+        let mut cfg = Config::default();
+        cfg.store.backend = StoreBackend::Memory;
+        cfg.store.bucket = "test".into();
+        cfg.cache.dir = directory.path().join("cache");
+        cfg.server.public_url = Some("http://walgit.invalid".into());
+        cfg.validate().unwrap();
+        let store: DynStore = MemoryStore::shared();
+        let state = super::AppState::new(std::sync::Arc::new(cfg), store)
+            .await
+            .unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let serve_path = path.clone();
+        let server = tokio::spawn(async move {
+            super::serve_unix(state, serve_path, async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+        });
+
+        let mut stream = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match tokio::net::UnixStream::connect(&path).await {
+                    Ok(stream) => return stream,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                        ) =>
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(error) => panic!("connect Unix HTTP listener: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("Unix HTTP listener readiness");
+        stream
+            .write_all(
+                b"GET /healthz HTTP/1.1\r\nHost: walgit.invalid\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        assert!(
+            response.starts_with(b"HTTP/1.1 200"),
+            "unexpected response: {}",
+            String::from_utf8_lossy(&response)
+        );
+
+        shutdown_tx.send(()).unwrap();
+        server.await.unwrap().unwrap();
+        assert!(path.exists());
     }
 }

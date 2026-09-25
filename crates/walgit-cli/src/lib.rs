@@ -83,12 +83,20 @@ struct ServerCli {
         default_value = "walgit.toml"
     )]
     config: PathBuf,
+
+    /// Bind HTTP to this Unix socket instead of opening a TCP listener.
+    #[arg(long, env = "WALGIT_UNIX_SOCKET")]
+    unix_socket: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
 enum Command {
     /// Run the HTTP server (smart HTTP v0/v2, LFS, optional maintenance loops).
-    Serve,
+    Serve {
+        /// Bind HTTP to this Unix socket instead of opening a TCP listener.
+        #[arg(long, env = "WALGIT_UNIX_SOCKET")]
+        unix_socket: Option<PathBuf>,
+    },
     /// Trigger compaction (geometric repack) for one repo or all.
     Compact {
         /// `owner/name` — omit with `--all` for every repo.
@@ -426,12 +434,20 @@ fn load_config(path: &std::path::Path) -> Config {
 
 pub fn main() -> Result<()> {
     let cli = Cli::parse();
-    run(&cli.config, cli.command.unwrap_or(Command::Serve))
+    run(
+        &cli.config,
+        cli.command.unwrap_or(Command::Serve { unix_socket: None }),
+    )
 }
 
 pub fn main_server() -> Result<()> {
     let cli = ServerCli::parse();
-    run(&cli.config, Command::Serve)
+    run(
+        &cli.config,
+        Command::Serve {
+            unix_socket: cli.unix_socket,
+        },
+    )
 }
 
 fn run(config: &std::path::Path, command: Command) -> Result<()> {
@@ -462,7 +478,7 @@ async fn dispatch(command: Command, cfg: Config) -> Result<()> {
             files,
             seed,
         } => synth::run(out, size, commits, files, seed).await,
-        Command::Serve => serve::run(&cfg).await,
+        Command::Serve { unix_socket } => serve::run(&cfg, unix_socket.as_deref()).await,
         Command::Compact {
             repo,
             all,
@@ -529,6 +545,30 @@ async fn dispatch(command: Command, cfg: Config) -> Result<()> {
             } else {
                 import::run(from, repo, reuse_packs, refs, &cfg).await
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod listener_cli_tests {
+    use super::*;
+
+    #[test]
+    fn both_server_entry_points_select_the_unix_listener_explicitly() {
+        let socket = PathBuf::from("/run/walgit/http.sock");
+        let server =
+            ServerCli::try_parse_from(["walgit-server", "--unix-socket", socket.to_str().unwrap()])
+                .unwrap();
+        assert_eq!(server.unix_socket.as_ref(), Some(&socket));
+
+        let cli =
+            Cli::try_parse_from(["walgit", "serve", "--unix-socket", socket.to_str().unwrap()])
+                .unwrap();
+        match cli.command {
+            Some(Command::Serve { unix_socket }) => {
+                assert_eq!(unix_socket.as_ref(), Some(&socket));
+            }
+            _ => panic!("serve command did not retain the Unix listener"),
         }
     }
 }

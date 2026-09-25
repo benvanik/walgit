@@ -4,6 +4,7 @@
 //! semaphores and metrics. The maintain role runs bounded maintenance tasks
 //! and upstream following; otherwise the compact role runs bounded pack lifecycle units.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -11,10 +12,10 @@ use tokio::signal;
 use tracing::{info, warn};
 
 use walgit_config::{Config, Role};
-use walgit_server::{AppState, serve};
+use walgit_server::{AppState, serve, serve_unix};
 use walgit_store::open_store;
 
-pub async fn run(cfg: &Arc<Config>) -> Result<()> {
+pub async fn run(cfg: &Arc<Config>, unix_socket: Option<&Path>) -> Result<()> {
     info!(backend = ?cfg.store.backend, "opening store");
     let store = open_store(cfg).await?;
     info!(backend = store.backend(), "store ready");
@@ -70,8 +71,13 @@ pub async fn run(cfg: &Arc<Config>) -> Result<()> {
         }
     };
 
-    info!(listen = %cfg.server.listen, "starting server");
-    serve(state, shutdown).await?;
+    if let Some(path) = unix_socket {
+        info!(path = %path.display(), "starting server on Unix socket");
+        serve_unix(state, path, shutdown).await?;
+    } else {
+        info!(listen = %cfg.server.listen, "starting server");
+        serve(state, shutdown).await?;
+    }
 
     // Cancel background loops.
     for h in bg_handles {
